@@ -1,10 +1,8 @@
-use std::{
-    io::{self, Read, Write},
-    thread,
-};
+use std::io::{self};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Default)]
 struct NodeState {
@@ -42,7 +40,7 @@ impl<'a> Node<'a> {
             MessageBody::Echo { msg_id, echo } => {
                 self.state.last_message_id += 1;
 
-                let msg = Message {
+                Message {
                     src: self.state.node_id.clone(),
                     dest: message.src,
                     body: MessageBody::EchoOk {
@@ -50,9 +48,19 @@ impl<'a> Node<'a> {
                         in_reply_to: msg_id,
                         echo,
                     },
-                };
+                }
+            }
+            MessageBody::Generate { msg_id } => {
+                self.state.last_message_id += 1;
 
-                msg
+                Message {
+                    src: self.state.node_id.clone(),
+                    dest: message.src,
+                    body: MessageBody::GenerateOk {
+                        in_reply_to: msg_id,
+                        id: Uuid::new_v4(),
+                    },
+                }
             }
             _ => unimplemented!("Message reply not implemented yet"),
         }
@@ -85,6 +93,13 @@ enum MessageBody {
     },
     InitOk {
         in_reply_to: u32,
+    },
+    Generate {
+        msg_id: u32,
+    },
+    GenerateOk {
+        in_reply_to: u32,
+        id: Uuid,
     },
 }
 
