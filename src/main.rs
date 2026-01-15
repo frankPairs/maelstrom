@@ -1,4 +1,7 @@
-use std::io::{self};
+use std::{
+    collections::HashMap,
+    io::{self},
+};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -7,6 +10,7 @@ use uuid::Uuid;
 #[derive(Debug, Default)]
 struct NodeState {
     node_id: String,
+    messages: Vec<i32>,
     last_message_id: u32,
 }
 
@@ -20,8 +24,8 @@ impl<'a> Node<'a> {
         Self { state }
     }
 
-    fn reply(&mut self, message: Message) -> Message {
-        match message.body {
+    fn reply(&mut self, msg: Message) -> Message {
+        match msg.body {
             MessageBody::Init {
                 msg_id,
                 node_id,
@@ -31,7 +35,7 @@ impl<'a> Node<'a> {
 
                 Message {
                     src: self.state.node_id.clone(),
-                    dest: message.src,
+                    dest: msg.src,
                     body: MessageBody::InitOk {
                         in_reply_to: msg_id,
                     },
@@ -42,7 +46,7 @@ impl<'a> Node<'a> {
 
                 Message {
                     src: self.state.node_id.clone(),
-                    dest: message.src,
+                    dest: msg.src,
                     body: MessageBody::EchoOk {
                         msg_id: self.state.last_message_id,
                         in_reply_to: msg_id,
@@ -55,10 +59,48 @@ impl<'a> Node<'a> {
 
                 Message {
                     src: self.state.node_id.clone(),
-                    dest: message.src,
+                    dest: msg.src,
                     body: MessageBody::GenerateOk {
                         in_reply_to: msg_id,
                         id: Uuid::new_v4(),
+                    },
+                }
+            }
+            MessageBody::Broadcast { msg_id, message } => {
+                self.state.last_message_id += 1;
+                self.state.messages.push(message);
+
+                Message {
+                    src: self.state.node_id.clone(),
+                    dest: msg.src,
+                    body: MessageBody::BroadcastOk {
+                        in_reply_to: msg_id,
+                    },
+                }
+            }
+            MessageBody::Read { msg_id } => {
+                self.state.last_message_id += 1;
+
+                Message {
+                    src: self.state.node_id.clone(),
+                    dest: msg.src,
+                    body: MessageBody::ReadOk {
+                        messages: self.state.messages.clone(),
+                        in_reply_to: msg_id,
+                    },
+                }
+            }
+            MessageBody::Topology {
+                msg_id,
+                topology: _,
+            } => {
+                self.state.last_message_id += 1;
+
+                Message {
+                    src: self.state.node_id.clone(),
+                    dest: msg.src,
+                    body: MessageBody::TopologyOk {
+                        in_reply_to: msg_id,
                     },
                 }
             }
@@ -100,6 +142,27 @@ enum MessageBody {
     GenerateOk {
         in_reply_to: u32,
         id: Uuid,
+    },
+    Broadcast {
+        msg_id: u32,
+        message: i32,
+    },
+    BroadcastOk {
+        in_reply_to: u32,
+    },
+    Read {
+        msg_id: u32,
+    },
+    ReadOk {
+        messages: Vec<i32>,
+        in_reply_to: u32,
+    },
+    Topology {
+        msg_id: u32,
+        topology: HashMap<String, Vec<String>>,
+    },
+    TopologyOk {
+        in_reply_to: u32,
     },
 }
 
