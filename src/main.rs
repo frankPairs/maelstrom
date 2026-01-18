@@ -45,9 +45,9 @@ impl<'a> Node {
                 let response = node.build_reply(
                     &msg,
                     &mut state_guard,
-                    Some(MessageBody::InitOk {
+                    MessageBody::InitOk {
                         in_reply_to: msg_id,
-                    }),
+                    },
                 );
 
                 let json =
@@ -108,22 +108,20 @@ impl<'a> Node {
             body => unimplemented!("Message {:?} not implemented yet", body),
         };
 
-        Ok(self.build_reply(&req, &mut state, body))
+        match body {
+            Some(b) => Ok(Some(self.build_reply(&req, &mut state, b))),
+            None => Ok(None),
+        }
     }
 
-    fn build_reply(
-        &self,
-        req: &Message,
-        state: &mut NodeState,
-        body: Option<MessageBody>,
-    ) -> Option<Message> {
+    fn build_reply(&self, req: &Message, state: &mut NodeState, body: MessageBody) -> Message {
         state.last_message_id += 1;
 
-        Some(Message {
+        Message {
             src: self.node_id.clone(),
             dest: req.src.clone(),
-            body: body?,
-        })
+            body: body,
+        }
     }
 }
 
