@@ -1,4 +1,5 @@
 use anyhow::Context;
+use core::time;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -10,21 +11,22 @@ use uuid::Uuid;
 
 #[derive(Debug, Default)]
 struct NodeState {
+    node_id: String,
+    node_ids: Vec<String>,
     messages: HashSet<i32>,
+    pending_gossips: HashSet<i32>,
     /// It represents a vector of node ids. These nodes will be used for gossiping.
     neighbors: Vec<String>,
     last_message_id: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Node {
-    node_id: String,
-    node_ids: Vec<String>,
     state: Arc<Mutex<NodeState>>,
 }
 
 impl<'a> Node {
-    fn init(line: String) -> anyhow::Result<Self> {
+    fn init(line: String, state: Arc<Mutex<NodeState>>) -> anyhow::Result<Self> {
         let msg: Message = serde_json::from_str(&line).context("Message deserialization error")?;
 
         match msg.body.clone() {
@@ -33,29 +35,26 @@ impl<'a> Node {
                 node_id,
                 node_ids,
             } => {
-                let state = Arc::new(Mutex::new(NodeState::default()));
+                let mut state_guard = state.lock().expect("State poisoned when executing init");
+
+                state_guard.node_id = node_id.clone();
+                state_guard.node_ids = node_ids;
+
                 let node = Self {
-                    node_id,
-                    node_ids,
                     state: state.clone(),
                 };
 
-                let mut state_guard = state.lock().expect("State poisoned when executing init");
-
-                let response = node.build_reply(
-                    &msg,
-                    &mut state_guard,
-                    MessageBody::InitOk {
+                let reply = Message {
+                    src: node_id,
+                    dest: msg.src,
+                    body: MessageBody::InitOk {
                         in_reply_to: msg_id,
                     },
-                );
+                };
 
-                let json =
-                    serde_json::to_string(&response).context("Message serialization error")?;
+                node.write(reply)?;
 
-                println!("{}", json);
-
-                anyhow::Ok(node)
+                Ok(node)
             }
             _ => Err(anyhow::anyhow!(
                 "Init message is not the first message received"
@@ -63,7 +62,7 @@ impl<'a> Node {
         }
     }
 
-    fn reply(&mut self, req: Message) -> anyhow::Result<Option<Message>> {
+    fn handle(&mut self, req: Message) -> anyhow::Result<Option<Message>> {
         let mut state = self
             .state
             .lock()
@@ -82,15 +81,12 @@ impl<'a> Node {
             }),
             MessageBody::Broadcast { msg_id, message } => {
                 state.messages.insert(message);
+                state.pending_gossips.insert(message);
 
-                if let Some(in_reply_to) = msg_id {
-                    Some(MessageBody::BroadcastOk {
-                        in_reply_to,
-                        msg_id: state.last_message_id + 1,
-                    })
-                } else {
-                    None
-                }
+                Some(MessageBody::BroadcastOk {
+                    in_reply_to: msg_id,
+                    msg_id: state.last_message_id + 1,
+                })
             }
             MessageBody::Read { msg_id } => Some(MessageBody::ReadOk {
                 msg_id: state.last_message_id + 1,
@@ -98,30 +94,50 @@ impl<'a> Node {
                 in_reply_to: msg_id,
             }),
             MessageBody::Topology { msg_id, topology } => {
-                state.neighbors = topology.keys().map(|k| k.to_string()).collect();
+                state.neighbors = topology
+                    .get(&state.node_id)
+                    .with_context(|| format!("Node {} does not have topology", state.node_id))?
+                    .to_vec();
 
                 Some(MessageBody::TopologyOk {
                     msg_id: state.last_message_id + 1,
                     in_reply_to: msg_id,
                 })
             }
+            MessageBody::Gossip { messages } => {
+                let kwown_messages = state.messages.clone();
+
+                // It adds to pending_gossips only the messages that the current node does not have
+                state
+                    .pending_gossips
+                    .extend(messages.iter().filter(|m| !kwown_messages.contains(m)));
+                state.messages.extend(messages.clone());
+
+                None
+            }
             body => unimplemented!("Message {:?} not implemented yet", body),
         };
 
         match body {
-            Some(b) => Ok(Some(self.build_reply(&req, &mut state, b))),
+            Some(b) => {
+                state.last_message_id += 1;
+
+                Ok(Some(Message {
+                    src: state.node_id.clone(),
+                    dest: req.src.clone(),
+                    body: b,
+                }))
+            }
             None => Ok(None),
         }
     }
 
-    fn build_reply(&self, req: &Message, state: &mut NodeState, body: MessageBody) -> Message {
-        state.last_message_id += 1;
+    fn write(&self, msg: Message) -> anyhow::Result<()> {
+        let json = serde_json::to_string(&msg).context("Message serialization error")?;
 
-        Message {
-            src: self.node_id.clone(),
-            dest: req.src.clone(),
-            body: body,
-        }
+        println!("{}", json);
+
+        Ok(())
     }
 }
 
@@ -161,7 +177,7 @@ enum MessageBody {
         id: Uuid,
     },
     Broadcast {
-        msg_id: Option<u32>,
+        msg_id: u32,
         message: i32,
     },
     BroadcastOk {
@@ -184,59 +200,101 @@ enum MessageBody {
         msg_id: u32,
         in_reply_to: u32,
     },
+    Gossip {
+        messages: HashSet<i32>,
+    },
+}
+
+#[derive(Debug)]
+enum Event {
+    // A node replies the request of a client.
+    Reply(Message),
+    // A node actively sends a message to a node or multiple nodes. An example
+    // of this event would be sending a gossip message to node's neighbors.
+    Push(Message),
+    // A node should shutdown
+    Shutdown,
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut lines = io::stdin().lines();
+    let state = Arc::new(Mutex::new(NodeState::default()));
+    let mut first_line = String::new();
 
     // The first line must be a init, otherwise it returns an error.
-    let mut node = match lines.next() {
-        Some(line) => Node::init(line?)?,
-        None => {
+    let stdin_state = state.clone();
+    let mut node = match io::stdin().read_line(&mut first_line) {
+        Ok(_) => Node::init(first_line, stdin_state)?,
+        Err(_) => {
             panic!("Init message is required")
         }
     };
+    let (tx, rx) = std::sync::mpsc::channel::<Event>();
 
-    for line in lines {
-        let content = line?;
+    // Stdin thread
+    let stdin_tx = tx.clone();
+    thread::spawn(move || -> anyhow::Result<()> {
+        let lines = io::stdin().lines();
 
-        let msg: Message =
-            serde_json::from_str(&content).context("Message deserialization error")?;
+        for line in lines {
+            let content = line?;
 
-        if let Some(response) = node.reply(msg.clone())? {
-            let json = serde_json::to_string(&response).context("Message serialization error")?;
+            let msg: Message =
+                serde_json::from_str(&content).context("Message deserialization error")?;
 
-            println!("{}", json);
+            stdin_tx
+                .send(Event::Reply(msg))
+                .context("Error when sending a Reply event")?;
+        }
 
-            // Gossiping messages to neighbour
-            match msg.body {
-                MessageBody::Broadcast { msg_id: _, message } => {
-                    let state = node.state.lock().expect("State poisoned");
-                    let neighbors = state.neighbors.clone();
-                    let node_id = node.node_id.clone();
+        stdin_tx
+            .send(Event::Shutdown)
+            .context("Error when sending a Shutdown event")?;
 
-                    thread::spawn(move || -> anyhow::Result<()> {
-                        for neighbor in neighbors {
-                            let message = Message {
-                                src: node_id.clone(),
-                                dest: neighbor,
-                                body: MessageBody::Broadcast {
-                                    msg_id: None,
-                                    message,
-                                },
-                            };
+        Ok(())
+    });
 
-                            let json = serde_json::to_string(&message)
-                                .context("Message serialization error")?;
+    // Gossip thread
+    let gossip_tx = tx.clone();
+    let gossip_state = state.clone();
+    thread::spawn(move || -> anyhow::Result<()> {
+        loop {
+            thread::sleep(time::Duration::from_millis(200));
 
-                            println!("{}", json);
-                        }
+            let mut state_guard = gossip_state
+                .lock()
+                .expect("State poisoned while sending a gossip");
 
-                        Ok(())
-                    });
+            if state_guard.pending_gossips.len() == 0 {
+                continue;
+            }
+
+            for neighbor in &state_guard.neighbors {
+                gossip_tx
+                    .send(Event::Push(Message {
+                        src: state_guard.node_id.clone(),
+                        dest: neighbor.to_string(),
+                        body: MessageBody::Gossip {
+                            messages: state_guard.pending_gossips.clone(),
+                        },
+                    }))
+                    .context("Error when sending a Push event")?;
+            }
+
+            state_guard.pending_gossips.clear();
+        }
+    });
+
+    while let Ok(evt) = rx.recv() {
+        match evt {
+            Event::Reply(msg) => {
+                if let Some(reply) = node.handle(msg.clone())? {
+                    node.write(reply)?;
                 }
-                _ => (),
-            };
+            }
+            Event::Push(msg) => {
+                node.write(msg)?;
+            }
+            Event::Shutdown => break,
         }
     }
 
