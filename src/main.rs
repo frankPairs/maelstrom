@@ -14,10 +14,38 @@ struct NodeState {
     node_id: String,
     node_ids: Vec<String>,
     messages: HashSet<i32>,
-    pending_gossips: HashSet<i32>,
     /// It represents a vector of node ids. These nodes will be used for gossiping.
     neighbors: Vec<String>,
     last_message_id: u32,
+    gossip_messages: GossipMessages,
+}
+
+#[derive(Debug, Default)]
+struct GossipMessages {
+    pending: HashSet<i32>,
+    sent: HashMap<u32, Message>,
+}
+
+impl GossipMessages {
+    fn insert_pending(&mut self, value: i32) {
+        self.pending.insert(value);
+    }
+
+    fn batch_insert_pending<'a, T: IntoIterator<Item = &'a i32>>(&mut self, values: T) {
+        self.pending.extend(values);
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    fn insert_sent(&mut self, msg_id: u32, message: &Message) {
+        self.sent.insert(msg_id, message.clone());
+    }
+
+    fn remove_message_sent(&mut self, msg_id: u32) {
+        self.sent.remove(&msg_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +109,7 @@ impl<'a> Node {
             }),
             MessageBody::Broadcast { msg_id, message } => {
                 state.messages.insert(message);
-                state.pending_gossips.insert(message);
+                state.gossip_messages.insert_pending(message);
 
                 Some(MessageBody::BroadcastOk {
                     in_reply_to: msg_id,
@@ -104,14 +132,26 @@ impl<'a> Node {
                     in_reply_to: msg_id,
                 })
             }
-            MessageBody::Gossip { messages } => {
+            MessageBody::Gossip { msg_id, messages } => {
                 let kwown_messages = state.messages.clone();
 
                 // It adds to pending_gossips only the messages that the current node does not have
                 state
-                    .pending_gossips
-                    .extend(messages.iter().filter(|m| !kwown_messages.contains(m)));
+                    .gossip_messages
+                    .batch_insert_pending(messages.iter().filter(|m| !kwown_messages.contains(m)));
                 state.messages.extend(messages.clone());
+
+                Some(MessageBody::GossipOk {
+                    msg_id: state.last_message_id + 1,
+                    in_reply_to: msg_id,
+                })
+            }
+            MessageBody::GossipOk {
+                msg_id,
+                in_reply_to: _,
+            } => {
+                // It acknowledge a message by removing it from gossip_messages.sent, so it is not necessary retry it.
+                state.gossip_messages.remove_message_sent(msg_id);
 
                 None
             }
@@ -201,7 +241,12 @@ enum MessageBody {
         in_reply_to: u32,
     },
     Gossip {
+        msg_id: u32,
         messages: HashSet<i32>,
+    },
+    GossipOk {
+        msg_id: u32,
+        in_reply_to: u32,
     },
 }
 
@@ -264,23 +309,60 @@ fn main() -> anyhow::Result<()> {
                 .lock()
                 .expect("State poisoned while sending a gossip");
 
-            if state_guard.pending_gossips.len() == 0 {
+            if state_guard.gossip_messages.pending.is_empty() {
                 continue;
             }
 
-            for neighbor in &state_guard.neighbors {
+            let mut msg_id = state_guard.last_message_id;
+            let neighbors = state_guard.neighbors.clone();
+
+            for neighbor in neighbors {
+                msg_id += 1;
+
+                let message = Message {
+                    src: state_guard.node_id.clone(),
+                    dest: neighbor.to_string(),
+                    body: MessageBody::Gossip {
+                        msg_id: msg_id,
+                        messages: state_guard.gossip_messages.pending.clone(),
+                    },
+                };
                 gossip_tx
-                    .send(Event::Push(Message {
-                        src: state_guard.node_id.clone(),
-                        dest: neighbor.to_string(),
-                        body: MessageBody::Gossip {
-                            messages: state_guard.pending_gossips.clone(),
-                        },
-                    }))
+                    .send(Event::Push(message.clone()))
                     .context("Error when sending a Push event")?;
+
+                state_guard.gossip_messages.insert_sent(msg_id, &message);
             }
 
-            state_guard.pending_gossips.clear();
+            state_guard.last_message_id = msg_id;
+            state_guard.gossip_messages.clear_pending();
+        }
+    });
+
+    // Retry thread
+    let retry_tx = tx.clone();
+    let retry_state = state.clone();
+    thread::spawn(move || -> anyhow::Result<()> {
+        // It retries send failed messages every 400ms. Messages that failed are saved in
+        // gossip_messages.sent. They are removed when they are acknowledge.
+        loop {
+            thread::sleep(time::Duration::from_millis(400));
+
+            let state_guard = retry_state
+                .lock()
+                .expect("State poisoned while sending a retry");
+
+            if state_guard.gossip_messages.sent.is_empty() {
+                continue;
+            }
+
+            let sent_messages = state_guard.gossip_messages.sent.clone();
+
+            for (_, msg) in sent_messages {
+                retry_tx
+                    .send(Event::Push(msg))
+                    .context("Error when sending a Push event")?;
+            }
         }
     });
 
