@@ -17,34 +17,35 @@ struct NodeState {
     /// It represents a vector of node ids. These nodes will be used for gossiping.
     neighbors: Vec<String>,
     last_message_id: u32,
-    gossip_messages: GossipMessages,
+    gossip_messages: GossipMessagesTracker,
 }
 
 #[derive(Debug, Default)]
-struct GossipMessages {
-    pending: HashSet<i32>,
-    sent: HashMap<u32, Message>,
+struct GossipMessagesTracker {
+    pending_to_send: HashSet<i32>,
+    waiting_for_acknowledgement: HashMap<u32, Message>,
 }
 
-impl GossipMessages {
+impl GossipMessagesTracker {
     fn insert_pending(&mut self, value: i32) {
-        self.pending.insert(value);
+        self.pending_to_send.insert(value);
     }
 
     fn batch_insert_pending<'a, T: IntoIterator<Item = &'a i32>>(&mut self, values: T) {
-        self.pending.extend(values);
+        self.pending_to_send.extend(values);
     }
 
     fn clear_pending(&mut self) {
-        self.pending.clear();
+        self.pending_to_send.clear();
     }
 
     fn insert_sent(&mut self, msg_id: u32, message: &Message) {
-        self.sent.insert(msg_id, message.clone());
+        self.waiting_for_acknowledgement
+            .insert(msg_id, message.clone());
     }
 
     fn remove_message_sent(&mut self, msg_id: u32) {
-        self.sent.remove(&msg_id);
+        self.waiting_for_acknowledgement.remove(&msg_id);
     }
 }
 
@@ -309,7 +310,7 @@ fn main() -> anyhow::Result<()> {
                 .lock()
                 .expect("State poisoned while sending a gossip");
 
-            if state_guard.gossip_messages.pending.is_empty() {
+            if state_guard.gossip_messages.pending_to_send.is_empty() {
                 continue;
             }
 
@@ -324,7 +325,7 @@ fn main() -> anyhow::Result<()> {
                     dest: neighbor.to_string(),
                     body: MessageBody::Gossip {
                         msg_id: msg_id,
-                        messages: state_guard.gossip_messages.pending.clone(),
+                        messages: state_guard.gossip_messages.pending_to_send.clone(),
                     },
                 };
                 gossip_tx
@@ -344,7 +345,7 @@ fn main() -> anyhow::Result<()> {
     let retry_state = state.clone();
     thread::spawn(move || -> anyhow::Result<()> {
         // It retries send failed messages every 400ms. Messages that failed are saved in
-        // gossip_messages.sent. They are removed when they are acknowledge.
+        // gossip_messages.waiting_for_acknowledgement. They are removed when they are acknowledge.
         loop {
             thread::sleep(time::Duration::from_millis(400));
 
@@ -352,11 +353,18 @@ fn main() -> anyhow::Result<()> {
                 .lock()
                 .expect("State poisoned while sending a retry");
 
-            if state_guard.gossip_messages.sent.is_empty() {
+            if state_guard
+                .gossip_messages
+                .waiting_for_acknowledgement
+                .is_empty()
+            {
                 continue;
             }
 
-            let sent_messages = state_guard.gossip_messages.sent.clone();
+            let sent_messages = state_guard
+                .gossip_messages
+                .waiting_for_acknowledgement
+                .clone();
 
             for (_, msg) in sent_messages {
                 retry_tx
