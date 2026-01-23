@@ -11,46 +11,17 @@ use uuid::Uuid;
 
 #[derive(Debug, Default)]
 struct NodeState {
-    node_id: String,
-    node_ids: Vec<String>,
     messages: HashSet<i32>,
     /// It represents a vector of node ids. These nodes will be used for gossiping.
     neighbors: Vec<String>,
     last_message_id: u32,
-    gossip_messages: GossipMessagesTracker,
-}
-
-#[derive(Debug, Default)]
-struct GossipMessagesTracker {
     pending_to_send: HashSet<i32>,
-    waiting_for_acknowledgement: HashMap<u32, Message>,
-}
-
-impl GossipMessagesTracker {
-    fn insert_pending(&mut self, value: i32) {
-        self.pending_to_send.insert(value);
-    }
-
-    fn batch_insert_pending<'a, T: IntoIterator<Item = &'a i32>>(&mut self, values: T) {
-        self.pending_to_send.extend(values);
-    }
-
-    fn clear_pending(&mut self) {
-        self.pending_to_send.clear();
-    }
-
-    fn insert_sent(&mut self, msg_id: u32, message: &Message) {
-        self.waiting_for_acknowledgement
-            .insert(msg_id, message.clone());
-    }
-
-    fn remove_message_sent(&mut self, msg_id: u32) {
-        self.waiting_for_acknowledgement.remove(&msg_id);
-    }
 }
 
 #[derive(Debug, Clone)]
 struct Node {
+    node_id: String,
+    node_ids: Vec<String>,
     state: Arc<Mutex<NodeState>>,
 }
 
@@ -64,12 +35,9 @@ impl<'a> Node {
                 node_id,
                 node_ids,
             } => {
-                let mut state_guard = state.lock().expect("State poisoned when executing init");
-
-                state_guard.node_id = node_id.clone();
-                state_guard.node_ids = node_ids;
-
                 let node = Self {
+                    node_id: node_id.clone(),
+                    node_ids,
                     state: state.clone(),
                 };
 
@@ -92,67 +60,94 @@ impl<'a> Node {
     }
 
     fn handle(&mut self, req: Message) -> anyhow::Result<Option<Message>> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("State poisoned while building reply");
-
         let body: Option<MessageBody> = match req.body.clone() {
             MessageBody::Echo { msg_id, echo } => Some(MessageBody::EchoOk {
-                msg_id: state.last_message_id + 1,
                 in_reply_to: msg_id,
                 echo,
             }),
             MessageBody::Generate { msg_id } => Some(MessageBody::GenerateOk {
-                msg_id: state.last_message_id + 1,
                 in_reply_to: msg_id,
                 id: Uuid::new_v4(),
             }),
             MessageBody::Broadcast { msg_id, message } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("State poisoned when replying to a broadcast message");
+
                 state.messages.insert(message);
-                state.gossip_messages.insert_pending(message);
+                state.pending_to_send.insert(message);
 
                 Some(MessageBody::BroadcastOk {
                     in_reply_to: msg_id,
-                    msg_id: state.last_message_id + 1,
                 })
             }
-            MessageBody::Read { msg_id } => Some(MessageBody::ReadOk {
-                msg_id: state.last_message_id + 1,
-                messages: state.messages.clone(),
-                in_reply_to: msg_id,
-            }),
+            MessageBody::Read { msg_id } => {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("State poisoned when replying to a broadcast message");
+
+                Some(MessageBody::ReadOk {
+                    messages: state.messages.clone(),
+                    in_reply_to: msg_id,
+                })
+            }
             MessageBody::Topology { msg_id, topology } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("State poisoned when replying to a broadcast message");
+
                 state.neighbors = topology
-                    .get(&state.node_id)
-                    .with_context(|| format!("Node {} does not have topology", state.node_id))?
+                    .get(&self.node_id)
+                    .with_context(|| format!("Node {} does not have topology", self.node_id))?
                     .to_vec();
 
                 Some(MessageBody::TopologyOk {
-                    msg_id: state.last_message_id + 1,
                     in_reply_to: msg_id,
                 })
             }
             MessageBody::Gossip { msg_id, messages } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("State poisoned when replying to a broadcast message");
+
                 let kwown_messages = state.messages.clone();
+                let unknown_messages: HashSet<i32> = messages
+                    .clone()
+                    .into_iter()
+                    .filter(|m| !kwown_messages.contains(m))
+                    .collect();
 
                 // It adds to pending_gossips only the messages that the current node does not have
-                state
-                    .gossip_messages
-                    .batch_insert_pending(messages.iter().filter(|m| !kwown_messages.contains(m)));
-                state.messages.extend(messages.clone());
+                state.pending_to_send.extend(unknown_messages.clone());
+                state.messages.extend(messages);
 
                 Some(MessageBody::GossipOk {
-                    msg_id: state.last_message_id + 1,
+                    messages: unknown_messages,
                     in_reply_to: msg_id,
                 })
             }
             MessageBody::GossipOk {
-                msg_id,
                 in_reply_to: _,
+                messages,
             } => {
-                // It acknowledge a message by removing it from gossip_messages.sent, so it is not necessary retry it.
-                state.gossip_messages.remove_message_sent(msg_id);
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("State poisoned when replying to a broadcast message");
+
+                let kwown_messages = state.messages.clone();
+
+                state.pending_to_send.extend(
+                    messages
+                        .clone()
+                        .into_iter()
+                        .filter(|m| !kwown_messages.contains(m)),
+                );
+                state.messages.extend(messages);
 
                 None
             }
@@ -160,15 +155,11 @@ impl<'a> Node {
         };
 
         match body {
-            Some(b) => {
-                state.last_message_id += 1;
-
-                Ok(Some(Message {
-                    src: state.node_id.clone(),
-                    dest: req.src.clone(),
-                    body: b,
-                }))
-            }
+            Some(b) => Ok(Some(Message {
+                src: self.node_id.clone(),
+                dest: req.src.clone(),
+                body: b,
+            })),
             None => Ok(None),
         }
     }
@@ -197,7 +188,6 @@ enum MessageBody {
         echo: String,
     },
     EchoOk {
-        msg_id: u32,
         in_reply_to: u32,
         echo: String,
     },
@@ -213,7 +203,6 @@ enum MessageBody {
         msg_id: u32,
     },
     GenerateOk {
-        msg_id: u32,
         in_reply_to: u32,
         id: Uuid,
     },
@@ -222,14 +211,12 @@ enum MessageBody {
         message: i32,
     },
     BroadcastOk {
-        msg_id: u32,
         in_reply_to: u32,
     },
     Read {
         msg_id: u32,
     },
     ReadOk {
-        msg_id: u32,
         messages: HashSet<i32>,
         in_reply_to: u32,
     },
@@ -238,7 +225,6 @@ enum MessageBody {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk {
-        msg_id: u32,
         in_reply_to: u32,
     },
     Gossip {
@@ -246,8 +232,8 @@ enum MessageBody {
         messages: HashSet<i32>,
     },
     GossipOk {
-        msg_id: u32,
         in_reply_to: u32,
+        messages: HashSet<i32>,
     },
 }
 
@@ -302,15 +288,21 @@ fn main() -> anyhow::Result<()> {
     // Gossip thread
     let gossip_tx = tx.clone();
     let gossip_state = state.clone();
+    let node_id = node.node_id.clone();
     thread::spawn(move || -> anyhow::Result<()> {
         loop {
-            thread::sleep(time::Duration::from_millis(200));
+            thread::sleep(time::Duration::from_millis(100));
 
             let mut state_guard = gossip_state
                 .lock()
                 .expect("State poisoned while sending a gossip");
 
-            if state_guard.gossip_messages.pending_to_send.is_empty() {
+            // If there are not neighbors, then we can close the thread
+            if state_guard.neighbors.len() == 0 {
+                break Ok(());
+            }
+
+            if state_guard.pending_to_send.is_empty() {
                 continue;
             }
 
@@ -321,68 +313,35 @@ fn main() -> anyhow::Result<()> {
                 msg_id += 1;
 
                 let message = Message {
-                    src: state_guard.node_id.clone(),
+                    src: node_id.clone(),
                     dest: neighbor.to_string(),
                     body: MessageBody::Gossip {
                         msg_id: msg_id,
-                        messages: state_guard.gossip_messages.pending_to_send.clone(),
+                        messages: state_guard.pending_to_send.clone(),
                     },
                 };
                 gossip_tx
                     .send(Event::Push(message.clone()))
                     .context("Error when sending a Push event")?;
-
-                state_guard.gossip_messages.insert_sent(msg_id, &message);
             }
 
-            state_guard.last_message_id = msg_id;
-            state_guard.gossip_messages.clear_pending();
-        }
-    });
-
-    // Retry thread
-    let retry_tx = tx.clone();
-    let retry_state = state.clone();
-    thread::spawn(move || -> anyhow::Result<()> {
-        // It retries send failed messages every 400ms. Messages that failed are saved in
-        // gossip_messages.waiting_for_acknowledgement. They are removed when they are acknowledge.
-        loop {
-            thread::sleep(time::Duration::from_millis(400));
-
-            let state_guard = retry_state
-                .lock()
-                .expect("State poisoned while sending a retry");
-
-            if state_guard
-                .gossip_messages
-                .waiting_for_acknowledgement
-                .is_empty()
-            {
-                continue;
-            }
-
-            let sent_messages = state_guard
-                .gossip_messages
-                .waiting_for_acknowledgement
-                .clone();
-
-            for (_, msg) in sent_messages {
-                retry_tx
-                    .send(Event::Push(msg))
-                    .context("Error when sending a Push event")?;
-            }
+            state_guard.pending_to_send.clear();
         }
     });
 
     while let Ok(evt) = rx.recv() {
         match evt {
             Event::Reply(msg) => {
-                if let Some(reply) = node.handle(msg.clone())? {
+                if let Some(reply) = node.handle(msg)? {
                     node.write(reply)?;
                 }
             }
             Event::Push(msg) => {
-                node.write(msg)?;
+                node.write(msg.clone())?;
+
+                if let Some(reply) = node.handle(msg)? {
+                    node.write(reply)?;
+                }
             }
             Event::Shutdown => break,
         }
