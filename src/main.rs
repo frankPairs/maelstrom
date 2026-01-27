@@ -183,6 +183,12 @@ impl<'a> Node {
                     .expect("State poisoned when replying to a broadcast message");
 
                 let internal_messages = state.messages.clone();
+                // Check if there are messages missing from the node sending the gossip ok message.
+                // We just compare the current node messages (which is the one that send the
+                // gossip) with the messages arriving from the destination node.
+                //
+                // This solution assumes that gossip ok includes all messages from the destination
+                // node.
                 let lost_messages = internal_messages
                     .clone()
                     .into_iter()
@@ -333,7 +339,7 @@ fn main() -> anyhow::Result<()> {
     let node_id = node.node_id.clone();
     thread::spawn(move || -> anyhow::Result<()> {
         loop {
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(time::Duration::from_millis(500));
 
             let state_guard = gossip_state
                 .lock()
