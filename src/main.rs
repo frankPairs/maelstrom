@@ -9,6 +9,38 @@ use std::{
 };
 use uuid::Uuid;
 
+struct StarTopology<'a> {
+    node_ids: &'a Vec<String>,
+}
+
+impl<'a> StarTopology<'a> {
+    fn new(node_ids: &'a Vec<String>) -> Self {
+        Self { node_ids }
+    }
+
+    fn get_topology(&self) -> HashMap<String, Vec<String>> {
+        let mut topology: HashMap<String, Vec<String>> = HashMap::new();
+
+        if self.node_ids.is_empty() {
+            return topology;
+        }
+
+        let mut node_ids_iter = self.node_ids.iter();
+        let leader = node_ids_iter.next().unwrap();
+        let mut followers = Vec::new();
+
+        for node_id in node_ids_iter {
+            followers.push(node_id.clone());
+
+            topology.insert(node_id.clone(), vec![leader.clone()]);
+        }
+
+        topology.insert(leader.clone(), followers);
+
+        topology
+    }
+}
+
 #[derive(Debug, Default)]
 struct NodeState {
     messages: HashSet<i32>,
@@ -60,6 +92,8 @@ impl<'a> Node {
     }
 
     fn handle(&mut self, req: Message) -> anyhow::Result<Option<Message>> {
+        let topology = StarTopology::new(&self.node_ids).get_topology();
+
         let body: Option<MessageBody> = match req.body.clone() {
             MessageBody::Echo { msg_id, echo } => Some(MessageBody::EchoOk {
                 in_reply_to: msg_id,
@@ -93,7 +127,10 @@ impl<'a> Node {
                     in_reply_to: msg_id,
                 })
             }
-            MessageBody::Topology { msg_id, topology } => {
+            MessageBody::Topology {
+                msg_id,
+                topology: _,
+            } => {
                 let mut state = self
                     .state
                     .lock()
@@ -101,53 +138,58 @@ impl<'a> Node {
 
                 state.neighbors = topology
                     .get(&self.node_id)
-                    .with_context(|| format!("Node {} does not have topology", self.node_id))?
+                    .with_context(|| format!("Node {} does not have neighbors", self.node_id))?
                     .to_vec();
 
                 Some(MessageBody::TopologyOk {
                     in_reply_to: msg_id,
                 })
             }
-            MessageBody::Gossip { msg_id, messages } => {
-                let mut state = self
-                    .state
-                    .lock()
-                    .expect("State poisoned when replying to a broadcast message");
-
-                let kwown_messages = state.messages.clone();
-                let unknown_messages: HashSet<i32> = messages
-                    .clone()
-                    .into_iter()
-                    .filter(|m| !kwown_messages.contains(m))
-                    .collect();
-
-                // It adds to pending_gossips only the messages that the current node does not have
-                state.pending_to_send.extend(unknown_messages.clone());
-                state.messages.extend(messages);
-
-                Some(MessageBody::GossipOk {
-                    messages: unknown_messages,
-                    in_reply_to: msg_id,
-                })
-            }
-            MessageBody::GossipOk {
-                in_reply_to: _,
-                messages,
+            MessageBody::Gossip {
+                msg_id,
+                messages: external_messages,
             } => {
                 let mut state = self
                     .state
                     .lock()
                     .expect("State poisoned when replying to a broadcast message");
 
-                let kwown_messages = state.messages.clone();
+                let internal_messages = state.messages.clone();
+                let new_messages: HashSet<i32> = internal_messages
+                    .clone()
+                    .into_iter()
+                    .filter(|m| !external_messages.contains(m))
+                    .collect();
 
-                state.pending_to_send.extend(
-                    messages
-                        .clone()
-                        .into_iter()
-                        .filter(|m| !kwown_messages.contains(m)),
-                );
-                state.messages.extend(messages);
+                // It adds to pending_gossips only the messages that the current node does not have
+                state.pending_to_send.extend(new_messages.clone());
+                state.messages.extend(external_messages);
+
+                Some(MessageBody::GossipOk {
+                    // We send all our messages back as part of the gossip ok response because the
+                    // node that sent us that message can ensure if the message was successfully
+                    // sent but comparing what we have with what they.
+                    messages: state.messages.clone(),
+                    in_reply_to: msg_id,
+                })
+            }
+            MessageBody::GossipOk {
+                in_reply_to: _,
+                messages: external_messages,
+            } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("State poisoned when replying to a broadcast message");
+
+                let internal_messages = state.messages.clone();
+                let lost_messages = internal_messages
+                    .clone()
+                    .into_iter()
+                    .filter(|m| !external_messages.contains(m));
+
+                state.pending_to_send.extend(lost_messages);
+                state.messages.extend(external_messages);
 
                 None
             }
@@ -293,7 +335,7 @@ fn main() -> anyhow::Result<()> {
         loop {
             thread::sleep(time::Duration::from_millis(100));
 
-            let mut state_guard = gossip_state
+            let state_guard = gossip_state
                 .lock()
                 .expect("State poisoned while sending a gossip");
 
@@ -324,8 +366,6 @@ fn main() -> anyhow::Result<()> {
                     .send(Event::Push(message.clone()))
                     .context("Error when sending a Push event")?;
             }
-
-            state_guard.pending_to_send.clear();
         }
     });
 
