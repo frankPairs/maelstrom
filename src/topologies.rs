@@ -45,7 +45,7 @@ impl Topology {
                 let node_ids_size = node_ids.len();
 
                 for (index, node_id) in node_ids.iter().enumerate() {
-                    let follower = if index < node_ids_size {
+                    let follower = if index + 1 < node_ids_size {
                         node_ids[index + 1].clone()
                     } else {
                         node_ids[0].clone()

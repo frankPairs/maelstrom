@@ -182,7 +182,7 @@ impl Node {
                 let node = Self {
                     node_id: node_id.clone(),
                     state: state.clone(),
-                    topology: Topology::StarTopology.get_topology(&node_ids),
+                    topology: Topology::RingTopology.get_topology(&node_ids),
                 };
 
                 let reply = Message {
