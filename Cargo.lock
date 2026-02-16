@@ -27,6 +27,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "g-counter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

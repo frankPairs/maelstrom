@@ -25,3 +25,7 @@ test-broadcast-d:
 test-broadcast-e:
 	cargo build --package broadcast --release
 	./client/maelstrom test -w broadcast --bin ./target/release/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100 
+
+test-g-counter:
+	cargo build --package g-counter --release
+	./client/maelstrom test -w g-counter --bin ./target/release/g-counter --node-count 3 --time-limit 20 --rate 100 --nemesis partition 

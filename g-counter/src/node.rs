@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use uuid::Uuid;
 
 use crate::topologies::Topology;
 
@@ -84,34 +83,12 @@ pub struct Message {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageBody {
-    Echo {
-        msg_id: u32,
-        echo: String,
-    },
-    EchoOk {
-        in_reply_to: u32,
-        echo: String,
-    },
     Init {
         msg_id: u32,
         node_id: String,
         node_ids: Vec<String>,
     },
     InitOk {
-        in_reply_to: u32,
-    },
-    Generate {
-        msg_id: u32,
-    },
-    GenerateOk {
-        in_reply_to: u32,
-        id: Uuid,
-    },
-    Broadcast {
-        msg_id: u32,
-        message: i32,
-    },
-    BroadcastOk {
         in_reply_to: u32,
     },
     Read {

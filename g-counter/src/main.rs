@@ -1,11 +1,15 @@
+mod node;
+mod topologies;
+
 use anyhow::Context;
 use core::time;
-use maelstrom::node::{Event, Message, MessageBody, Node, NodeState};
 use std::{
     io::{self},
     sync::{Arc, Mutex},
     thread,
 };
+
+use node::{Event, Message, MessageBody, Node, NodeState};
 
 fn main() -> anyhow::Result<()> {
     let state = Arc::new(Mutex::new(NodeState::default()));
